@@ -1,29 +1,36 @@
+import org.apache.parquet.format.IntType
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.ml.Estimator
 import org.apache.spark.ml.param._
-import org.apache.spark.ml.param.shared.{HasLabelCol, HasPredictionCol}
+import org.apache.spark.ml.param.shared.{HasLabelCol, HasMaxIter, HasPredictionCol}
 import org.apache.spark.ml.util.{DefaultParamsReadable, DefaultParamsWritable, Identifiable}
 import org.apache.spark.sql.{DataFrame, Dataset}
-import org.apache.spark.sql.types.{DoubleType, FloatType, StructField, StructType}
+import org.apache.spark.sql.types._
 import org.apache.spark.ml.Model
-import org.apache.spark.sql.functions.lit
 
 import scala.collection.mutable.ListBuffer
 import scala.util.Random
 
 trait GaussianMixtureParams extends Params
-  with HasLabelCol with HasPredictionCol {
+  with HasLabelCol with HasPredictionCol with HasMaxIter {
 
   val k = new IntParam(this, "k", "Number of clusters to train for.")
 
   def setK(value: Int): this.type = set(k -> value)
+
   setDefault(k -> 3)
 
   def getK: Int = $(k)
 
+  val showProb = new BooleanParam(this, "showProb", "Probabilities associated to each cluster.")
+
+  def setShowProb(value: Boolean): this.type = set(showProb -> value)
+
+  def getShowProb: Boolean = $(showProb)
+
   def pdf(X: List[Double], mean: Double, variance: Double) = {
-    val s1 = 1/(Math.sqrt(2*Math.PI*variance))
-    val s2 = X.map(value => Math.exp(-1* (Math.pow(value - mean, 2)/(2 * variance))))
+    val s1 = 1 / (Math.sqrt(2 * Math.PI * variance))
+    val s2 = X.map(value => Math.exp(-1 * (Math.pow(value - mean, 2) / (2 * variance))))
 
     s2.map(s1 * _)
   }
@@ -38,6 +45,10 @@ class GaussianMixtureEstimator(override val uid: String) extends Estimator[Gauss
 
   def setPredictionCol(value: String): this.type = set(predictionCol -> value)
 
+  def setMaxIter(value: Int): this.type = set(maxIter -> value)
+
+  setDefault(maxIter -> 25)
+
   @DeveloperApi
   override def transformSchema(schema: StructType): StructType = {
     schema
@@ -48,7 +59,7 @@ class GaussianMixtureEstimator(override val uid: String) extends Estimator[Gauss
 
   override def fit(dataset: Dataset[_]): GaussianMixtureNMModel = {
 
-    val multiplyList  = (a: List[Double], b: List[Double]) => {
+    val multiplyList = (a: List[Double], b: List[Double]) => {
       a.zip(b).map {
         case (i, j) => i.toDouble * j.toDouble
       }
@@ -63,7 +74,7 @@ class GaussianMixtureEstimator(override val uid: String) extends Estimator[Gauss
     val means = Random.shuffle(X).take($(k)).toArray
     val variances = Seq.fill($(k))(Random.nextDouble).toArray
 
-    (0 to 25).foreach(_ => {
+    (0 to $(maxIter)).foreach(_ => {
       val likelihood = new ListBuffer[List[Double]]()
       val b = new ListBuffer[List[Double]]
       (0 until $(k)).foreach(j => {
@@ -71,15 +82,16 @@ class GaussianMixtureEstimator(override val uid: String) extends Estimator[Gauss
       })
       //likelihood.foreach(println)
       (0 until $(k)).foreach(j => {
-        val updatedLocalLikelihood = likelihood(j).map(_* weights(j))
+        val updatedLocalLikelihood = likelihood(j).map(_ * weights(j))
         val updatedGlobalLikelihood = (0 until $(k)).foldLeft(ListBuffer[List[Double]]())((sum, step) => {
           sum.append(likelihood(step).map(_ * weights(step)))
           sum
         })
-          val finalGlobalLikelihood = updatedGlobalLikelihood(0).zipWithIndex.map{
-            case (elem, indice) => {
+        val finalGlobalLikelihood = updatedGlobalLikelihood(0).zipWithIndex.map {
+          case (elem, indice) => {
             (1 until $(k)).foldLeft(elem)((sum, indice2) => sum + updatedGlobalLikelihood(indice2)(indice))
-          }}
+          }
+        }
 
 
         b.append(updatedLocalLikelihood.zip(finalGlobalLikelihood).map {
@@ -103,22 +115,22 @@ object GaussianMixtureEstimator extends DefaultParamsReadable[GaussianMixtureEst
 }
 
 case class GaussianMixtureNMModel(override val uid: String,
-                                   weightsModel: Array[Double],
-                                    variancesModel: Array[Double],
-                                    meanModel: Array[Double]
-                             )
+                                  weightsModel: Array[Double],
+                                  variancesModel: Array[Double],
+                                  meanModel: Array[Double]
+                                 )
 
   extends Model[GaussianMixtureNMModel] with DefaultParamsWritable
-  with GaussianMixtureParams {
+    with GaussianMixtureParams {
 
   override def copy(extra: ParamMap): GaussianMixtureNMModel = defaultCopy(extra)
 
   override def transformSchema(schema: StructType): StructType = {
-    StructType(Seq(StructField($(predictionCol), DoubleType, true)).++(schema))
+    StructType(Seq(StructField($(predictionCol), IntegerType, true)).++(schema))
   }
 
   override def transform(dataset: Dataset[_]): DataFrame = {
-    val X = dataset
+    val Y = dataset
       .select($(labelCol))
       .collect.map(r => r.getDouble(0))
       .toList
@@ -126,19 +138,20 @@ case class GaussianMixtureNMModel(override val uid: String,
     val likelihood = new ListBuffer[List[Double]]
     val b = new ListBuffer[List[Double]]
     (0 until $(k)).foreach(j => {
-      likelihood.append(pdf(X, meanModel(j), Math.sqrt(variancesModel(j))))
+      likelihood.append(pdf(Y, meanModel(j), Math.sqrt(variancesModel(j))))
     })
     //likelihood.foreach(println)
     (0 until $(k)).foreach(j => {
-      val updatedLocalLikelihood = likelihood(j).map(_* weightsModel(j))
+      val updatedLocalLikelihood = likelihood(j).map(_ * weightsModel(j))
       val updatedGlobalLikelihood = (0 until $(k)).foldLeft(ListBuffer[List[Double]]())((sum, step) => {
         sum.append(likelihood(step).map(_ * weightsModel(step)))
         sum
       })
-      val finalGlobalLikelihood = updatedGlobalLikelihood(0).zipWithIndex.map{
+      val finalGlobalLikelihood = updatedGlobalLikelihood(0).zipWithIndex.map {
         case (elem, indice) => {
           (1 until $(k)).foldLeft(elem)((sum, indice2) => sum + updatedGlobalLikelihood(indice2)(indice))
-        }}
+        }
+      }
 
       b.append(updatedLocalLikelihood.zip(finalGlobalLikelihood).map {
         case (a, b) => a.toDouble / b.toDouble
@@ -146,21 +159,37 @@ case class GaussianMixtureNMModel(override val uid: String,
     })
 
     val predictions = new ListBuffer[Double]()
-    X.zipWithIndex.foreach {
+    Y.zipWithIndex.foreach {
       case (_, i) => {
         predictions.append(
           (0 until $(k)).foldLeft(new ListBuffer[Double]())((list, index) => {
-          list.append(b(index)(i))
-          list
-        })
-          .zipWithIndex.maxBy(_._1)._2)
+            list.append(b(index)(i))
+            list
+          })
+            .zipWithIndex.maxBy(_._1)._2)
       }
     }
 
-    dataset.withColumn($(predictionCol), lit(predictions)).toDF
+    val spark = dataset.sparkSession
+    import spark.implicits._
+    import org.apache.spark.sql.functions.monotonically_increasing_id
+
+    val predictionsDf = spark
+      .sparkContext
+      .parallelize(predictions.map(_.toInt + 1))
+      .toDF($(predictionCol))
+      .withColumn("id", monotonically_increasing_id)
+
+
+    dataset
+      .withColumn("id", monotonically_increasing_id())
+      .join(predictionsDf, "id")
+      .drop("id")
+      .toDF
+
   }
 }
 
-object GaussianMixtureNMModel  extends DefaultParamsReadable[GaussianMixtureNMModel] {
+object GaussianMixtureNMModel extends DefaultParamsReadable[GaussianMixtureNMModel] {
   override def load(path: String): GaussianMixtureNMModel = super.load(path)
 }
